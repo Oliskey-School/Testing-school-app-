@@ -25,8 +25,6 @@ async function warmDemoBackend(page: Page, baseURL: string, role: string) {
         lastBody = await response.text();
 
         if (response.ok()) return;
-        // The demo seeder may still be warming a fresh CI database. The backend
-        // intentionally returns 503 instead of blocking the request on seeding.
         if (response.status() === 503 || /warming|seed/i.test(lastBody)) {
             await page.waitForTimeout(2000);
             continue;
@@ -38,7 +36,6 @@ async function warmDemoBackend(page: Page, baseURL: string, role: string) {
 }
 
 async function loginAsDemo(page: Page, baseURL: string, role: 'admin' | 'teacher' | 'student' | 'parent') {
-    // Start clean so CI retries cannot inherit a previous role/session.
     await page.goto(baseURL, { waitUntil: 'domcontentloaded' });
     await page.evaluate(() => {
         sessionStorage.clear();
@@ -46,22 +43,19 @@ async function loginAsDemo(page: Page, baseURL: string, role: 'admin' | 'teacher
         localStorage.removeItem('auth_refresh_token');
     });
 
-    // Warm/validate the real demo API first. This removes a race between the
-    // server's background demo seed and the first UI click, while the actual
-    // login below is still performed through the production UI.
     await warmDemoBackend(page, baseURL, role);
 
-    const demoBtn = page.getByRole('button', { name: /Try Demo School/i });
+    // The visible label is translated. Match the semantic action instead of
+    // hard-coding one English translation, so locale changes cannot break CI.
+    const demoBtn = page.locator('button').filter({ hasText: /demo/i }).first();
     await demoBtn.waitFor({ state: 'visible', timeout: 30_000 });
+    await expect(demoBtn).toBeEnabled();
     await demoBtn.click();
 
     const tile = page.locator(`button:has-text("${role}")`).first();
     await tile.waitFor({ state: 'visible', timeout: 10_000 });
     await tile.click();
 
-    // Demo login can legitimately need a second attempt after a fresh seed.
-    // Do not hide real application failures: retry only while the login shell
-    // is still visible and no authenticated token/dashboard has appeared.
     for (let attempt = 0; attempt < 5; attempt++) {
         const authenticated = await page.evaluate(() => !!sessionStorage.getItem('auth_token'));
         const adminHook = await page.evaluate(() => typeof (window as any).ADMIN_NAVIGATE === 'function');
@@ -126,12 +120,6 @@ async function onboardThrowawaySchool(request: APIRequestContext, apiBase: strin
     return { email, password: 'CiTestPass!23', schoolId: body.data.schoolId as string };
 }
 
-/**
- * Creates an already-verified test tenant directly in the isolated CI database.
- * This is deliberately test-fixture code: production onboarding requires email
- * verification, while this test needs authenticated tokens to prove tenant
- * isolation. No production database is reachable from this workflow.
- */
 async function createIsolationFixture(tag: string) {
     const unique = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`.toUpperCase();
     const school = await prisma.school.create({
@@ -290,7 +278,7 @@ test.describe('Production critical path', () => {
             localStorage.clear();
         });
         await page.reload({ waitUntil: 'domcontentloaded' });
-        await expect(page.getByRole('button', { name: /Try Demo School/i })).toBeVisible({ timeout: 15_000 });
+        await expect(page.locator('button').filter({ hasText: /demo/i }).first()).toBeVisible({ timeout: 15_000 });
     });
 
     test('Role permissions — a teacher cannot reach admin-only data', async ({ page, baseURL }) => {
