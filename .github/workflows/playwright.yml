@@ -5,6 +5,10 @@ name: E2E Tests
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+      - 'codex/**'
   pull_request:
     branches: [main]
   schedule:
@@ -38,10 +42,6 @@ jobs:
       REFRESH_TOKEN_SECRET: ci-only-refresh-signing-key-not-used-for-real
       NODE_ENV: development
       BACKEND_PORT: 5099
-      # The browser serves the built frontend on :4173 while the API server
-      # runs on :5099. Without this explicit build-time URL, lib/config.ts
-      # detects localhost and falls back to :5000, so demo login and every
-      # authenticated API call are sent to the wrong port.
       VITE_API_URL: http://127.0.0.1:5099/api
       VITE_SOCKET_URL: http://127.0.0.1:5099
 
@@ -113,9 +113,6 @@ jobs:
           curl -fsSI "http://127.0.0.1:4173/api/health" || true
 
       # Diagnostic only: never replaces or weakens the real critical-path gate.
-      # Persist the first-load browser state so a future auth-shell regression
-      # can be diagnosed from the artifact even when GitHub's live job-log API
-      # does not expose the browser output.
       - name: Diagnose browser boot
         continue-on-error: true
         run: |

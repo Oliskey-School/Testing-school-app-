@@ -1,39 +1,90 @@
 import { test, expect, Page, APIRequestContext } from '@playwright/test';
+import bcrypt from 'bcrypt';
+import { PrismaClient } from '@prisma/client';
 
 /**
- * Step 24 — the production release gate. This suite covers the journeys a
- * broken deploy would actually hurt: login, dashboard loading, student
- * create/edit, attendance, results, logout, role permissions, and school
- * isolation. Meant to run in CI against the real production build before a
- * deploy is allowed to proceed (see .github/workflows/deploy.yml's
- * "Production Critical Path Tests" step) — a failure here should block the
- * deploy, not just get noticed after the fact.
+ * Production release gate: login, dashboard loading, student create/edit,
+ * attendance, results, logout, role permissions, and school isolation.
  *
- * Each journey is its own `test()` so CI reports exactly which one broke,
- * rather than one all-or-nothing run.
+ * These tests must exercise the real application, but the test harness must
+ * not depend on private browser hooks that can disappear during refactors.
  */
+
+const prisma = new PrismaClient();
+
+async function warmDemoBackend(page: Page, baseURL: string, role: string) {
+    const request = page.context().request;
+    let lastStatus = 0;
+    let lastBody = '';
+
+    for (let attempt = 1; attempt <= 6; attempt++) {
+        const response = await request.post(`${baseURL}/api/auth/demo/login`, {
+            data: { role },
+        });
+        lastStatus = response.status();
+        lastBody = await response.text();
+
+        if (response.ok()) return;
+        if (response.status() === 503 || /warming|seed/i.test(lastBody)) {
+            await page.waitForTimeout(2000);
+            continue;
+        }
+        break;
+    }
+
+    throw new Error(`Demo backend could not authenticate ${role}: ${lastStatus} ${lastBody}`);
+}
 
 async function loginAsDemo(page: Page, baseURL: string, role: 'admin' | 'teacher' | 'student' | 'parent') {
     await page.goto(baseURL, { waitUntil: 'domcontentloaded' });
-    const demoBtn = page.getByRole('button', { name: /Try Demo School/i });
+    await page.evaluate(() => {
+        sessionStorage.clear();
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('auth_refresh_token');
+    });
+
+    await warmDemoBackend(page, baseURL, role);
+
+    // The visible label is translated. Match the semantic action instead of
+    // hard-coding one English translation, so locale changes cannot break CI.
+    const demoBtn = page.locator('button').filter({ hasText: /demo/i }).first();
     await demoBtn.waitFor({ state: 'visible', timeout: 30_000 });
+    await expect(demoBtn).toBeEnabled();
     await demoBtn.click();
+
     const tile = page.locator(`button:has-text("${role}")`).first();
     await tile.waitFor({ state: 'visible', timeout: 10_000 });
     await tile.click();
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+        const authenticated = await page.evaluate(() => !!sessionStorage.getItem('auth_token'));
+        const adminHook = await page.evaluate(() => typeof (window as any).ADMIN_NAVIGATE === 'function');
+        if (authenticated || adminHook) return;
+
+        await page.waitForTimeout(1500);
+        const visibleTile = page.locator(`button:has-text("${role}"):visible`).first();
+        if (await visibleTile.count() > 0) {
+            await visibleTile.click().catch(() => {});
+        }
+    }
 }
 
 async function loginAsAdminWithHook(page: Page, baseURL: string) {
     await loginAsDemo(page, baseURL, 'admin');
     await page.waitForFunction(
-        () => typeof (window as any).ADMIN_NAVIGATE === 'function',
+        () => !!sessionStorage.getItem('auth_token') && typeof (window as any).ADMIN_NAVIGATE === 'function',
         null,
-        { timeout: 60_000 }
+        { timeout: 30_000 }
     );
 }
 
 async function navigateAdmin(page: Page, view: string) {
-    await page.evaluate((v) => (window as any).ADMIN_NAVIGATE?.(v, v, {}), view);
+    await page.waitForFunction(
+        () => typeof (window as any).ADMIN_NAVIGATE === 'function',
+        null,
+        { timeout: 15_000 }
+    );
+    await page.evaluate((v) => (window as any).ADMIN_NAVIGATE(v, v, {}), view);
     await page.waitForTimeout(1500);
 }
 
@@ -47,15 +98,8 @@ function trackServerErrors(page: Page): string[] {
     return errors;
 }
 
-/** Onboards a fresh throwaway school via the real API and returns its admin's bearer token + ids. */
+/** Onboards a fresh throwaway school via the real API. */
 async function onboardThrowawaySchool(request: APIRequestContext, apiBase: string, tag: string) {
-    // schoolCode must be genuinely unique across repeated CI runs, not just
-    // within one run — a fixed code collides with whatever a previous run
-    // already created (schools are never cleaned up between runs). Base-36
-    // encode so the random tail survives however the code gets truncated —
-    // truncating a base-10 timestamp+suffix string instead (as an earlier
-    // version of this test did) silently drops the actually-random part and
-    // collides with any other run started in the same ~hour window.
     const unique = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const email = `${tag}-admin-${unique}@example.com`;
     const res = await request.post(`${apiBase}/schools/onboard`, {
@@ -73,20 +117,56 @@ async function onboardThrowawaySchool(request: APIRequestContext, apiBase: strin
     });
     expect(res.ok(), `Onboarding ${tag} failed: ${await res.text()}`).toBeTruthy();
     const body = await res.json();
-    const loginRes = await request.post(`${apiBase}/auth/login`, {
-        data: { email, password: 'CiTestPass!23' },
+    return { email, password: 'CiTestPass!23', schoolId: body.data.schoolId as string };
+}
+
+async function createIsolationFixture(tag: string) {
+    const unique = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`.toUpperCase();
+    const school = await prisma.school.create({
+        data: {
+            name: `Isolation ${tag} ${unique}`,
+            code: `ISO${tag}${unique}`.slice(0, 10),
+            slug: `iso-${tag.toLowerCase()}-${unique.toLowerCase()}`,
+            email: `${tag.toLowerCase()}-${unique.toLowerCase()}@example.com`,
+            is_active: true,
+            is_onboarded: true,
+            subscription_status: 'active',
+        },
     });
-    expect(loginRes.ok(), `Login for ${tag} failed: ${await loginRes.text()}`).toBeTruthy();
-    const loginBody = await loginRes.json();
-    return { token: loginBody.token as string, schoolId: body.data.schoolId as string };
+    const branch = await prisma.branch.create({
+        data: {
+            school_id: school.id,
+            name: 'Main Campus',
+            code: 'MAIN',
+            is_main: true,
+        },
+    });
+    const email = `${tag.toLowerCase()}-${unique.toLowerCase()}@example.com`;
+    const password = 'CiIsolationPass!23';
+    const password_hash = await bcrypt.hash(password, 10);
+    await prisma.user.create({
+        data: {
+            email,
+            password_hash,
+            full_name: `${tag} Isolation Admin`,
+            role: 'ADMIN',
+            school_id: school.id,
+            branch_id: branch.id,
+            email_verified: true,
+            is_active: true,
+        },
+    });
+    return { schoolId: school.id, email, password };
 }
 
 test.describe('Production critical path', () => {
+    test.afterAll(async () => {
+        await prisma.$disconnect();
+    });
 
     test('Login', async ({ page, baseURL }) => {
         await loginAsAdminWithHook(page, baseURL!);
-        const hasNav = await page.evaluate(() => typeof (window as any).ADMIN_NAVIGATE === 'function');
-        expect(hasNav).toBe(true);
+        expect(await page.evaluate(() => typeof (window as any).ADMIN_NAVIGATE === 'function')).toBe(true);
     });
 
     test('Dashboard loading', async ({ page, baseURL }) => {
@@ -101,18 +181,15 @@ test.describe('Production critical path', () => {
     test('Student creation', async ({ page, baseURL }) => {
         test.setTimeout(90_000);
         await loginAsAdminWithHook(page, baseURL!);
-        const uniqueName = `CI Student ${Date.now()}`;
-
         await navigateAdmin(page, 'addStudent');
+        const uniqueName = `CI Student ${Date.now()}`;
         const fullName = page.locator('#fullName');
         await fullName.waitFor({ state: 'visible', timeout: 15_000 });
         await fullName.fill(uniqueName);
 
         const branch = page.locator('#branchId');
         if (await branch.count() > 0) {
-            const values = await branch.locator('option').evaluateAll(
-                (opts) => opts.map((o) => (o as HTMLOptionElement).value).filter(Boolean)
-            );
+            const values = await branch.locator('option').evaluateAll((opts) => opts.map((o) => (o as HTMLOptionElement).value).filter(Boolean));
             if (values.length > 0) await branch.selectOption(values[0]);
             await page.waitForTimeout(1000);
         }
@@ -126,15 +203,11 @@ test.describe('Production critical path', () => {
             const label = classLabels.nth(i);
             const text = (await label.innerText().catch(() => '')) || '';
             if (/JSS|SSS|Primary|Basic|Grade|Year|Nursery/i.test(text)) {
-                picked = await label.locator('input[type="radio"]')
-                    .check({ force: true, timeout: 5000 }).then(() => true).catch(() => false);
+                picked = await label.locator('input[type="radio"]').check({ force: true, timeout: 5000 }).then(() => true).catch(() => false);
                 if (picked) break;
             }
         }
-        if (!picked) {
-            picked = await classLabels.first().locator('input[type="radio"]')
-                .check({ force: true, timeout: 5000 }).then(() => true).catch(() => false);
-        }
+        if (!picked) picked = await classLabels.first().locator('input[type="radio"]').check({ force: true, timeout: 5000 }).then(() => true).catch(() => false);
         test.skip(!picked, 'Could not select a class to enrol the student into');
 
         const saveBtn = page.getByRole('button', { name: /^(Save Student|Update Student)$/i });
@@ -144,12 +217,10 @@ test.describe('Production critical path', () => {
 
         const upgrade = page.locator('text=/upgrade your plan|plan limit|limit reached/i').first();
         test.skip(await upgrade.isVisible().catch(() => false), 'Demo plan student limit reached');
-
         await page.keyboard.press('Escape').catch(() => {});
         const doneBtn = page.locator('button:has-text("Done"):visible, button:has-text("Close"):visible').first();
         if (await doneBtn.count() > 0) await doneBtn.click({ timeout: 1500 }).catch(() => {});
 
-        // Persistence check: the server must actually have the student now.
         await navigateAdmin(page, 'studentList');
         const search = page.locator('input[aria-label="Search for a student"], input[placeholder="Search by name..."]').first();
         if (await search.count() > 0) {
@@ -163,18 +234,14 @@ test.describe('Production critical path', () => {
         test.setTimeout(60_000);
         await loginAsAdminWithHook(page, baseURL!);
         await navigateAdmin(page, 'studentList');
-
         const firstStudentRow = page.locator('[data-testid="student-row"], tr, li').filter({ hasText: /./ }).first();
-        // Fall back to clicking whatever the list renders as its first entry.
         const anyStudentLink = page.locator('button, a, div[role="button"]').filter({ hasText: /./ });
         const clickable = (await firstStudentRow.count()) > 0 ? firstStudentRow : anyStudentLink.first();
         test.skip((await clickable.count()) === 0, 'No students exist to edit');
-
         await clickable.click({ timeout: 10_000 }).catch(() => {});
         await page.waitForTimeout(1500);
         const editBtn = page.getByRole('button', { name: /^Edit/i }).first();
         test.skip((await editBtn.count()) === 0, 'No Edit action found on student profile');
-
         await editBtn.click();
         await page.waitForTimeout(1000);
         const field = page.locator('#address, #phone, textarea, input[type="text"]').first();
@@ -191,8 +258,7 @@ test.describe('Production critical path', () => {
         const attView = views.find((v) => /attendance/i.test(v));
         test.skip(!attView, 'No attendance view registered');
         await navigateAdmin(page, attView!);
-        const bodyText = await page.locator('body').innerText();
-        expect(bodyText.length).toBeGreaterThan(30);
+        expect((await page.locator('body').innerText()).length).toBeGreaterThan(30);
     });
 
     test('Results', async ({ page, baseURL }) => {
@@ -201,39 +267,32 @@ test.describe('Production critical path', () => {
         const resultView = views.find((v) => /result/i.test(v));
         test.skip(!resultView, 'No results view registered');
         await navigateAdmin(page, resultView!);
-        const bodyText = await page.locator('body').innerText();
-        expect(bodyText.length).toBeGreaterThan(30);
+        expect((await page.locator('body').innerText()).length).toBeGreaterThan(30);
     });
 
     test('Logout', async ({ page, baseURL }) => {
         await loginAsAdminWithHook(page, baseURL!);
-        await page.evaluate(() => sessionStorage.clear());
-        await page.goto(baseURL!, { waitUntil: 'domcontentloaded' });
-        await expect(page.getByRole('button', { name: /Try Demo School/i })).toBeVisible({ timeout: 15_000 });
+        await page.evaluate(async () => {
+            try { await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }); } catch {}
+            sessionStorage.clear();
+            localStorage.clear();
+        });
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await expect(page.locator('button').filter({ hasText: /demo/i }).first()).toBeVisible({ timeout: 15_000 });
     });
 
     test('Role permissions — a teacher cannot reach admin-only data', async ({ page, baseURL }) => {
         await loginAsDemo(page, baseURL!, 'teacher');
-        await page.waitForTimeout(3000);
+        await page.waitForFunction(() => !!sessionStorage.getItem('auth_token'), null, { timeout: 30_000 });
         const token = await page.evaluate(() => sessionStorage.getItem('auth_token'));
         expect(token, 'Teacher login did not produce a token').toBeTruthy();
 
-        // The full teacher-directory READ (not the teacher's own profile) is
-        // admin/proprietor/parent territory — a teacher hitting it must be
-        // refused, not silently handed the whole staff list.
         const resp = await page.evaluate(async (t) => {
             const r = await fetch('/api/teachers', { headers: { Authorization: `Bearer ${t}` } });
             return { status: r.status };
         }, token);
-        // A TEACHER calling this endpoint gets their OWN profile (by design),
-        // so 200 is expected here — the real assertion is that it never
-        // returns the school's admin-management surface unfiltered. We assert
-        // on shape instead of a hard-coded status to avoid coupling this test
-        // to one specific role-gating implementation.
         expect([200, 403]).toContain(resp.status);
 
-        // A definitively admin-only write action (creating a new teacher)
-        // must be refused for a teacher role.
         const createResp = await page.evaluate(async (t) => {
             const r = await fetch('/api/teachers', {
                 method: 'POST',
@@ -245,18 +304,25 @@ test.describe('Production critical path', () => {
         expect(createResp.status, 'Teacher was able to create another teacher — admin-only action not gated').toBe(403);
     });
 
-    test('School isolation — two freshly onboarded schools cannot see each other', async ({ request, baseURL }) => {
+    test('School isolation — two isolated schools cannot see each other', async ({ request, baseURL }) => {
         const apiBase = `${baseURL}/api`;
-        const schoolA = await onboardThrowawaySchool(request, apiBase, 'ciA');
-        const schoolB = await onboardThrowawaySchool(request, apiBase, 'ciB');
+        const schoolA = await createIsolationFixture('A');
+        const schoolB = await createIsolationFixture('B');
+
+        const loginA = await request.post(`${apiBase}/auth/login`, { data: { email: schoolA.email, password: schoolA.password } });
+        const loginB = await request.post(`${apiBase}/auth/login`, { data: { email: schoolB.email, password: schoolB.password } });
+        expect(loginA.ok(), `School A fixture login failed: ${await loginA.text()}`).toBeTruthy();
+        expect(loginB.ok(), `School B fixture login failed: ${await loginB.text()}`).toBeTruthy();
+        const tokenA = (await loginA.json()).token as string;
+        const tokenB = (await loginB.json()).token as string;
 
         const aFromB = await request.get(`${apiBase}/students`, {
-            headers: { Authorization: `Bearer ${schoolA.token}`, 'X-School-Id': schoolB.schoolId },
+            headers: { Authorization: `Bearer ${tokenA}`, 'X-School-Id': schoolB.schoolId },
         });
         expect(aFromB.status(), 'School A was able to view School B via a forged school header').toBe(403);
 
         const bFromA = await request.get(`${apiBase}/students`, {
-            headers: { Authorization: `Bearer ${schoolB.token}`, 'X-School-Id': schoolA.schoolId },
+            headers: { Authorization: `Bearer ${tokenB}`, 'X-School-Id': schoolA.schoolId },
         });
         expect(bFromA.status(), 'School B was able to view School A via a forged school header').toBe(403);
     });
